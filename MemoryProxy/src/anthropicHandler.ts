@@ -327,6 +327,11 @@ function buildUpstreamBody(
   if (target.bodyOverrides) {
     result = { ...result, ...target.bodyOverrides };
   }
+  // patch-6.2: CC 2.1.220+ 客户端会自动加 output_config，ducky 上游不认，剥掉
+  if ((result as Record<string, unknown>).output_config !== undefined) {
+    result = { ...result };
+    delete (result as Record<string, unknown>).output_config;
+  }
   const sanitized = sanitizeThinkingBlocks(result);
   return { body: sanitized.body, sanitizedCount: sanitized.removed };
 }
@@ -354,9 +359,11 @@ function buildUpstreamHeaders(
   //   - non-empty string → inject as server-side key, drop client's own
   //   - empty/undefined  → passthrough: keep whatever the client sent
   // The cost-guard extension can still fully override via target.authHeaders.
+  // ★ tdai-lab fork: ducky 上游是 Bearer-only（x-api-key 会 401 / get token from header error），
+  //   出站用 Authorization: Bearer 替代 x-api-key。见 补充说明 §16。
   if (effectiveApiKey && !target.authHeaders) {
-    headers["x-api-key"] = effectiveApiKey;
-    delete headers["authorization"];
+    headers["authorization"] = `Bearer ${effectiveApiKey}`;
+    delete headers["x-api-key"];
   }
 
   if (target.authHeaders) {
@@ -370,6 +377,9 @@ function buildUpstreamHeaders(
   if (sessionKey) {
     headers["x-vertex-ai-session-id"] = sessionKey;
   }
+  // patch-6.3: Node fetch 不解 zstd；ducky 支持 zstd。若不限制，上游返回 zstd 二进制
+  // 会原样透传给客户端 → JSON.parse 失败 / SSE 切不出 event。锁死到 fetch 认的编码集。
+  headers["accept-encoding"] = "gzip, deflate, br";
   return headers;
 }
 

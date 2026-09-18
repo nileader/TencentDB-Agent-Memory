@@ -1,5 +1,12 @@
 allowBuilds:
-  better-sqlite3: true
   esbuild: true
-  node-pty: true
+  better-sqlite3: true
   protobufjs: true
+  tree-sitter-bash: true
+  node-pty: true
+  '@google/genai': false
+  es5-ext: false
+  koffi: false
+  mongodb-memory-server: false
+  node-llama-cpp: false
+  openclaw: false
