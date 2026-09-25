@@ -134,3 +134,28 @@ fi
 
 echo ""
 echo "✅ sync 完成。运行 $SCRIPTS/self-check.sh 做 5 层自检。"
+
+# ── 父仓库 pointer 提醒 ─────────────────────────────
+# 本仓库是 ~ 主仓库的 submodule。sync 之后 submodule 内出了新 SHA，
+# 父仓库看到 `M workspace/install/TencentDB-Agent-Memory`——pointer 还是旧的。
+# git 内置 --show-superproject-working-tree 在嵌套多层的 submodule 上不可靠，
+# 直接向上找 .gitmodules 里登记了本 REPO 相对路径的祖先。
+find_superproject() {
+  local dir="$REPO"
+  while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+    dir=$(dirname "$dir")
+    if [ -f "$dir/.gitmodules" ] && grep -qE "^\s*path\s*=\s*.*TencentDB-Agent-Memory" "$dir/.gitmodules"; then
+      echo "$dir"; return 0
+    fi
+  done
+  return 1
+}
+if super=$(find_superproject); then
+  new_sha=$(git rev-parse HEAD)
+  if (cd "$super" && git status --porcelain 2>/dev/null | grep -qE "workspace/install/TencentDB-Agent-Memory$"); then
+    echo ""
+    echo "🔔 父仓库 ($super) submodule pointer 未更新："
+    echo "   cd $super && git add workspace/install/TencentDB-Agent-Memory"
+    echo "   (是否 commit 由你自己决定；当前 submodule HEAD = $new_sha)"
+  fi
+fi

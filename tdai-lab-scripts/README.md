@@ -16,7 +16,7 @@
 |---|---|
 | `apply-proxy-patches.sh` | 幂等把手册 §6.1/6.2/6.3 三条补丁打到 `MemoryProxy/src/anthropicHandler.ts`（Bearer / strip output_config / no-zstd） |
 | `sync-from-fork.sh` | 一键工作流：拉 origin → 更新镜像 → 重设工作分支 → 重放补丁 → pnpm install → snapshot commit → (可选) 重启栈 |
-| `self-check.sh` | 5 层自检：进程端口 / 补丁 marker / e2e / L0 记录 / L2 场景 |
+| `cc-statusline-tdai-check.sh` | 5 层自检：进程端口 / 补丁 marker / e2e / L0 记录 / L2 场景（探针已挪到 common-toolkit 仓） |
 
 ## 日常工作流
 
@@ -24,7 +24,7 @@
 # 1. GitHub 网页：nileader/fork ← 上游同步 (Sync fork 按钮)
 # 2. 本机：
 ~/workspace/install/TencentDB-Agent-Memory/tdai-lab-scripts/sync-from-fork.sh
-~/workspace/install/TencentDB-Agent-Memory/tdai-lab-scripts/self-check.sh
+~/workspace/common-toolkit/ai/memory/tdai/cc-statusline-tdai-check.sh   # 探针已挪到 common-toolkit 仓
 ```
 
 ## 首装新机
@@ -37,7 +37,7 @@ git remote set-url --push upstream no_push
 git checkout linux/tdai-lab-patches   # 已含补丁 + pnpm
 cd MemoryProxy && pnpm install && cd ..
 # 建 ~/.tdai-lab/ 骨架（proxy.yaml/user.key/凭证等）见搭建手册 §2-§5
-tdai-lab-scripts/self-check.sh
+~/workspace/common-toolkit/ai/memory/tdai/cc-statusline-tdai-check.sh
 ```
 
 ## 关联

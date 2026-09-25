@@ -1,0 +1,1280 @@
+# TencentDB Agent Memory —— 搭建·操作手册
+
+> **本文只管「从零搭起来 + 验证记忆闭环」**。纯 step-by-step 命令，**为什么这么做、碰到的坑、原理**统一见 `tencentdb-agent-memory搭建 - 补充说明.md`（下称「补充」）。
+> 架构：**MemoryProxy（代理·转发+注入+沉淀触发，:8096）+ MemoryCore（内核·记忆存储与提炼，:8420）**，客户端(CC)把 API 地址指向 proxy 即可。
+> 本机环境：**Docker 不可用 → 走源码模式（tsx 直跑）**；提炼脑走 idealab OpenAI 端点，向量化走本地 Ollama bge-m3，数据全部本地。
+> 密钥占位：`<idealab-token>`、`<sk-mem-admin-key>` 换成你自己的值，**别写进任何被 git 跟踪的文件**。
+> ⚠️ 全程遵守生命线原则：验证阶段**不碰主 CC**、上游可先用 mock；确认体感 OK 再按第 5 节接主 CC（可逆）。
+
+---
+
+## 0. 前置准备
+
+### 0.1 Node —— 统一用 v22（关键）
+proxy 入口**硬卡 v22.x**（非 v22 直接退出）；core 要求 `>=22.16.0`。**两个都用 node 22 跑、且在 node 22 下 `npm install`**，可一次性避开 native 模块 ABI 不匹配（见「补充 §7」）。
+```sh
+# 已装 nvm 跳过
+git clone https://github.com/nvm-sh/nvm.git ~/.nvm
+. "$HOME/.nvm/nvm.sh"
+nvm install 22
+nvm use 22
+node -v          # 必须 v22.x（实测 v22.23.2）
+```
+
+### 0.2 源码就位（以 submodule 方式挂到 `~/workspace/install/`）
+父工程是 `~`（家目录的 git 仓库），沿用 cognee 那份的 submodule 体例：
+```sh
+cd ~
+git submodule add git@github.com:TencentCloud/TencentDB-Agent-Memory.git workspace/install/TencentDB-Agent-Memory
+git commit -m "add TencentDB-Agent-Memory submodule"
+cd ~/workspace/install/TencentDB-Agent-Memory
+```
+> 已 clone 过的机器复现：`git submodule update --init --recursive`。
+> 升级源码：`cd ~/workspace/install/TencentDB-Agent-Memory && git pull` → 重跑下面的 `npm install` → 回父仓库 `git add workspace/install/TencentDB-Agent-Memory && git commit`。
+
+### 0.3 装依赖（用 pnpm，必须在 node 22 下）
+
+> ⚠️ 三条硬前提，不满足必踩坑（原理详见「补充 §7」）：
+> ① 用 pnpm，不用 npm；② 每个子包（MemoryCore / MemoryProxy）各跑一次 `pnpm install`（仓库根没有 workspace 配置）；③ native 依赖白名单写到子包的 `pnpm-workspace.yaml` 的 `allowBuilds:` map，不是 `package.json`。
+
+```sh
+. "$HOME/.nvm/nvm.sh" && nvm use 22 && node -v      # v22.x
+
+# pnpm 用 corepack 走（跟着 node 自带，不用全局 npm i -g）
+corepack enable
+corepack prepare pnpm@latest --activate
+pnpm -v                                             # 应 >=12
+```
+
+**白名单 native 依赖**（见「补充 §7」）：
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+ROOT = Path.home() / "workspace/install/TencentDB-Agent-Memory"
+ALLOW = ["esbuild", "better-sqlite3", "protobufjs", "tree-sitter-bash", "node-pty"]
+DENY  = ["@google/genai", "es5-ext", "koffi", "mongodb-memory-server", "node-llama-cpp", "openclaw"]
+
+for sub in ("MemoryCore", "MemoryProxy"):
+    p = ROOT / sub / "pnpm-workspace.yaml"
+    lines = ["allowBuilds:"]
+    for k in ALLOW: lines.append(f"  {k}: true")
+    for k in DENY:
+        key = f"'{k}'" if any(c in k for c in "@/") else k
+        lines.append(f"  {key}: false")
+    p.write_text("\n".join(lines) + "\n")
+    print(f"✓ 写入 {p}")
+PY
+
+# 分别在 MemoryCore / MemoryProxy 装依赖（子包各有自己的 workspace 配置，仓库根没有）
+cd ~/workspace/install/TencentDB-Agent-Memory/MemoryCore  && pnpm install
+cd ~/workspace/install/TencentDB-Agent-Memory/MemoryProxy && pnpm install
+```
+> ⚠️ 若装完仍报 `ERR_PNPM_IGNORED_BUILDS` 且列出你本没在名单里的包 —— 把该包加进上面脚本的 `DENY` 数组（`false`=明示拒绝，pnpm 就不再警告），重跑对应子包的 `pnpm install`（见「补充 §7」）。
+
+**验证 native 依赖确已编译**：
+```sh
+# esbuild 二进制存在（tsx 跑 TS 需要）
+find ~/workspace/install/TencentDB-Agent-Memory -path "*esbuild/bin/esbuild" 2>/dev/null | head -1
+# better-sqlite3 native binding 存在（proxy 会话缓存用）
+find ~/workspace/install/TencentDB-Agent-Memory -path "*better-sqlite3*/build/Release/*.node" 2>/dev/null | head -1
+# tsx 可执行存在（core/proxy 都靠它跑 TS）
+ls ~/workspace/install/TencentDB-Agent-Memory/MemoryCore/node_modules/.bin/tsx
+ls ~/workspace/install/TencentDB-Agent-Memory/MemoryProxy/node_modules/.bin/tsx
+```
+> 四行都应有输出。缺 better-sqlite3 native binding → proxy 会话缓存降级到内存（不致命，见「补充 §7」）。
+
+### 0.4 Ollama（提供 embedding）
+```sh
+curl -fsSL https://ollama.com/install.sh | sh     # 已装跳过
+ollama pull bge-m3
+curl -s http://localhost:11434/api/version         # 应返回版本号
+```
+
+### 0.5 隔离数据目录
+```sh
+mkdir -p ~/.tdai-lab/data          # 数据、配置、密钥都放这（与任何现存记忆库隔离）
+```
+
+---
+
+## 1. 配置 MemoryCore（记忆内核）
+
+创建配置文件 `~/.tdai-lab/tdai-gateway.yaml`（第 2 节启动 core 时会用 `TDAI_GATEWAY_CONFIG` 环境变量指向它）：
+
+```yaml
+deployMode: standalone
+stateBackend: local
+
+server:
+  port: 8420
+  host: 127.0.0.1
+
+data:
+  baseDir: /home/admin/.tdai-lab/data
+
+# ── 提炼脑：idealab OpenAI 兼容端点（已实测 200，Bearer 鉴权）──
+llm:
+  baseUrl: "https://idealab.alibaba-inc.com/api/openai/v1"
+  apiKey: "<idealab-token>"
+  model: "Qwen3.8-Max-DogFooding"
+  maxTokens: 32000
+  timeoutMs: 300000
+
+# ── 向量化：本地 Ollama OpenAI-compat（已实测 dim=1024）──
+embedding:
+  enabled: true
+  provider: openai
+  baseUrl: "http://localhost:11434/v1"
+  apiKey: "ollama"
+  model: "bge-m3"
+  dimensions: 1024
+  sendDimensions: false
+  timeoutMs: 30000
+
+memory:
+  promptMode: chat            # 个人 1:1 脑，非 code 模式（否则纯闲聊抽 0 条，见「补充 §12」）
+  capture: { enabled: true }
+  extraction:
+    enabled: true
+    enableDedup: true
+    maxMemoriesPerSession: 20
+  persona:
+    triggerEveryN: 3          # 攒够 3 条新记忆就升 L3（验证期调小，生产可回默认 50）
+    maxScenes: 10
+  pipeline:
+    everyNConversations: 3    # 每 3 轮触发一次提炼（验证期调小）
+    enableWarmup: true
+    l1IdleTimeoutSeconds: 60
+    l2DelayAfterL1Seconds: 30
+    l2MinIntervalSeconds: 120
+    l2MaxIntervalSeconds: 600
+  recall:
+    enabled: true
+    maxResults: 5
+    scoreThreshold: 0.01      # ★关键：默认 0.3 会滤掉本地 bge-m3 的低分命中，实测调 0.01 才召得回（见「补充 §9」）
+    strategy: hybrid
+    timeoutMs: 8000
+  storeBackend: sqlite
+
+skill:
+  enabled: false              # 不用 skill 抽取，省内存
+```
+
+> ⚠️ idealab 有限流（约 5 请求/60s）。`everyNConversations`/`persona.triggerEveryN` 别调太激进，否则后台提炼并发打爆限流导致沉淀失败（见「补充 §12」）。
+
+---
+
+## 2. 启动 MemoryCore + 初始化 admin key
+
+### 2.1 启动 core（后台，源码模式）
+
+★推荐：直接用 §3.4 的 `start-all.sh` 一把起 core/mock/proxy 三件——它天生带 `setsid + </dev/null + disown`，切终端不掉线（原理见「补充 §8b」）。
+
+下面这段"手动启动"仅作**首次调试**或**只想起 core** 时用，产线常态请回到 §3.4：
+
+```sh
+. "$HOME/.nvm/nvm.sh" && nvm use 22
+cd ~/workspace/install/TencentDB-Agent-Memory/MemoryCore
+setsid nohup env TDAI_GATEWAY_CONFIG=$HOME/.tdai-lab/tdai-gateway.yaml \
+  npx tsx src/gateway/server.ts >> ~/.tdai-lab/memory-core.log 2>&1 </dev/null &
+disown
+sleep 5
+curl -sS -o /dev/null -w "core health=%{http_code}\n" http://127.0.0.1:8420/health   # 应 200
+```
+> ★三件套 `setsid + </dev/null + disown` 缺一不可，仅 `nohup &` 会被"关终端"传导杀掉（现象与原因见「补充 §8b」）。
+
+### 2.2 初始化 admin user，拿到 sk-mem key
+core 首次要建一个 admin user，返回的 `user_key`（格式 `sk-mem-xxx`）就是后面 proxy 数据面用的密钥（见「补充 §4」）。
+```sh
+# 自己生成一把（或让 core 生成后回读）；这里用固定传入法
+KEY="sk-mem-$(openssl rand -base64 48 | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32)"
+RESP=$(curl -sS -X POST http://127.0.0.1:8420/v3/internal/meta/user/init-admin \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -d "$(printf '{"username":"admin","user_key":"%s"}' "$KEY")")
+echo "$RESP"
+# 200=新建成功；409=已存在（复用你之前存的 key）
+umask 077
+printf '%s' "$KEY" > ~/.tdai-lab/user.key
+echo "admin key 已存 ~/.tdai-lab/user.key : $(cat ~/.tdai-lab/user.key)"
+# 注意：响应里的 data.user_id（形如 usr-xxxx）是 admin 账号的**鉴权 uid**，只用于校验 sk-mem 是否合法；
+# 与记忆里的 user_id（命名空间键）是两个域——后者由 proxy 的 sessionInit.debugForceIdentity 决定
+# （不填就落 "u_debug"）。所以这里不需要把 admin uid 存下来。见「补充 §5.2」。
+```
+
+### 2.3 校验 key 可用
+```sh
+curl -sS -X POST http://127.0.0.1:8420/v3/meta/auth/verify \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -d "$(printf '{"user_key":"%s"}' "$(cat ~/.tdai-lab/user.key)")" -w "\n[HTTP %{http_code}]\n"
+# 应 200
+```
+
+---
+
+## 3. 配置并启动 MemoryProxy（代理）
+
+### 3.1 写 `~/.tdai-lab/proxy.yaml`
+这是**无 fork 单用户配方**（原理见「补充 §2/§3/§4」）：`auth` 关 + `sessionInit.debugForceIdentity` 提供稳定身份 + 上游 `apiKey` 留空做透传 + `tdai.apiKey` 用真 sk-mem 走数据面。
+
+```yaml
+server:
+  host: 127.0.0.1
+  port: 8096
+  forwardTimeoutMs: 600000
+
+# ── 上游：验证期用 mock（见 3.3），接主 CC 时换成 ducky（见第 5 节）──
+upstream:
+  # ★url 必须写完整的"含 /v1 前缀"的基址（见「补充 §13」）：
+  #   proxy 把入站 /v1/messages 砍成 /messages 后拼到 upstream URL 上；
+  #   如果 upstream 只到 /proxy，实际转发路径是 /proxy/messages → 502 Bad Gateway；
+  #   写成 /proxy/v1，转发路径才对齐 /proxy/v1/messages。
+  #   mock 端接受任意路径（都 200），所以 mock 阶段 url 不带 /v1 也能通——真上游才卡这。
+  url: "http://127.0.0.1:8199"     # 验证期 mock；生产改 https://ducky.code.alibaba-inc.com/proxy/v1
+  apiKey: ""                       # ★留空=passthrough：入站 Bearer 原样透传，不注 x-api-key（见「补充 §2」）
+
+log:
+  file: ""
+  level: debug
+  backend: console
+
+# ── 对接 MemoryCore：注入 + 沉淀 + 召回 ──
+tdai:
+  enabled: true
+  endpoint: "http://127.0.0.1:8420"
+  apiKey: "<sk-mem-admin-key>"     # ★用 2.2 拿到的 sk-mem（数据面：沉淀/召回都用它，见「补充 §4」）
+  serviceId: default
+  memory:
+    enabled: true
+    inject: true
+    writeL0: true
+    recallL1: true
+    injectL2L3: true
+
+auth:
+  enabled: false                   # ★关鉴权：入站不做 user_key 校验（见「补充 §2」）
+
+# ★静态提供身份：auth 关掉后靠它给出稳定 team/agent/user，否则记忆整个失效（见「补充 §3」）
+sessionInit:
+  enabled: true
+  debugForceIdentity:
+    team_id: "tdai-lab"
+    agent_id: "brain"
+    task_id: "validate"
+
+injection:
+  enabled: true
+  injectors:
+    - tdai-memory                  # 只开这个；skill/knowledge 依赖 memory-hub，不装则静默降级
+
+costGuard:
+  enabled: false
+redis:
+  enabled: false
+```
+
+### 3.2 启动 proxy（后台，必须 node 22）
+
+★推荐同 2.1，用 §3.4 的 `start-all.sh` 起。下面这段是首次调试用的手动版：
+
+```sh
+. "$HOME/.nvm/nvm.sh" && nvm use 22
+cd ~/workspace/install/TencentDB-Agent-Memory/MemoryProxy
+setsid nohup node --import tsx/esm src/index.ts --config $HOME/.tdai-lab/proxy.yaml \
+  >> ~/.tdai-lab/proxy.log 2>&1 </dev/null &
+disown
+sleep 4
+curl -sS -o /dev/null -w "proxy up=%{http_code}\n" http://127.0.0.1:8096/ 2>/dev/null || echo "查 proxy.log"
+```
+> `proxy up=404` 是**正常**：proxy 只挂 `/claude-code/*` 和 `/memory-bridge/*` 这类具体路由，根路径无 handler → 404。真正的失败信号是 connection refused / 超时 / 空响应（此时进程可能已挂，查 `proxy.log`）。
+> 报 `Cannot find package 'tsx'` → proxy 没装 devDep tsx，见「补充 §7」（借 core 的 tsx 二进制）。
+> 报 node 版本错 → 没切 v22，回 0.1。
+
+**3.2.1 进一步确认 proxy 真在干活**（可选但推荐）：
+```sh
+# ① proxy 进程还在？
+ps -p $(cat ~/.tdai-lab/proxy.pid) -o pid,cmd
+# ② 日志末尾应见 server.listening + injection:tdai-memory + tdai:http://127.0.0.1:8420
+tail -20 ~/.tdai-lab/proxy.log
+```
+> 预期：进程存在、日志出现 `server.listening {"address":"127.0.0.1","port":8096}` 且无堆栈。
+> `connectivity.check` 里的 `creditReport: FAIL` 是 costGuard 探测告警，我们 `costGuard.enabled:false`，忽略。
+> **别在此时探 `/memory-bridge/*`**：bridge 依赖 `/claude-code/*` 转发路径把会话身份先建出来（`sessionInit.debugForceIdentity` 只在转发中间件里注入），跳过转发单探 bridge 会得到 `session not initialized`——这是设计如此，不是故障。真正验 bridge 见 §4.4。
+
+### 3.3 （验证期）起 mock 上游，避免动 ducky
+```sh
+cat > ~/.tdai-lab/mock-upstream.mjs <<'EOF'
+import http from "node:http";
+import fs from "node:fs";
+const CAP = "/home/admin/.tdai-lab/mock-headers.json";
+http.createServer((req, res) => {
+  let body = ""; req.on("data", c => body += c); req.on("end", () => {
+    fs.appendFileSync(CAP, JSON.stringify({
+      url: req.url, authorization: req.headers["authorization"] ?? null,
+      "x-api-key": req.headers["x-api-key"] ?? null, bodyLen: body.length }) + "\n");
+    if (req.method === "POST" && req.url.includes("messages"))
+      fs.writeFileSync("/home/admin/.tdai-lab/mock-lastbody.json", body);
+    res.writeHead(200, {"content-type":"application/json"});
+    res.end(JSON.stringify({id:"msg_mock",type:"message",role:"assistant",
+      content:[{type:"text",text:"ok from mock"}],usage:{input_tokens:12,output_tokens:6}}));
+  });
+}).listen(8199, "127.0.0.1", () => console.log("mock on 8199"));
+EOF
+setsid nohup node $HOME/.tdai-lab/mock-upstream.mjs >> ~/.tdai-lab/mock.log 2>&1 </dev/null &
+disown
+sleep 1
+cat ~/.tdai-lab/mock.log     # 应见 "mock on 8199"，无堆栈
+curl -sS -o /dev/null -w "mock=%{http_code}\n" http://127.0.0.1:8199/anything -X POST -d '{}'  # 200
+```
+
+---
+
+### 3.4 常驻托管脚本（一次写好，从此不靠 nohup 命令）★强推
+
+为什么需要这一步：**只用 `nohup` 挡不住关终端**——切/关一个终端窗口，core/mock/proxy 就会集体消失（本机首装实测踩过，根因和为什么不走 systemd 见「补充 §8b」）。这一节把三件套 `setsid + </dev/null + disown` 收进三个脚本，从此启停用脚本，不再手敲 nohup。
+
+**Step 1：明确脚本写入目录 —— `~/.tdai-lab/`**
+
+三份脚本统一放在 `~/.tdai-lab/`，跟配置、密钥、数据同目录，可整目录删（`rm -rf ~/.tdai-lab` = 一切归零，主 CC 零残留）。
+
+```sh
+ls ~/.tdai-lab/    # 应已存在（0.5 建过）；否则 mkdir -p ~/.tdai-lab
+```
+
+**Step 2：写 `~/.tdai-lab/start-all.sh`**（拉起 core → mock → proxy，幂等）
+
+```sh
+cat > ~/.tdai-lab/start-all.sh <<'SH'
+#!/usr/bin/env bash
+# 拉起 TencentDB Agent Memory 三件套（core + mock + proxy）
+# 幂等：已在跑的服务不会重复启动；会写 pid 到 ~/.tdai-lab/*.pid
+set -u
+
+TDAI_HOME="$HOME/.tdai-lab"
+REPO="$HOME/workspace/install/TencentDB-Agent-Memory"
+
+# ── nvm & node 22（proxy 硬卡 v22.x）──
+export NVM_DIR="$HOME/.nvm"
+# shellcheck disable=SC1091
+. "$NVM_DIR/nvm.sh" >/dev/null
+nvm use 22 >/dev/null || { echo "❌ nvm use 22 失败"; exit 1; }
+echo "node=$(node -v)"
+
+is_running() {
+  local pidfile="$1"
+  [[ -s "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+start_core() {
+  if is_running "$TDAI_HOME/core.pid"; then
+    echo "✓ core 已在跑 (pid=$(cat "$TDAI_HOME/core.pid"))"
+    return
+  fi
+  echo "→ 启动 core (:8420)"
+  cd "$REPO/MemoryCore" || exit 1
+  setsid nohup env TDAI_GATEWAY_CONFIG="$TDAI_HOME/tdai-gateway.yaml" \
+    npx tsx src/gateway/server.ts >> "$TDAI_HOME/memory-core.log" 2>&1 </dev/null &
+  disown
+  sleep 5
+  # 拿真实 pid（tsx 会 spawn 子进程；抓 --import tsx/esm 之外的 gateway/server 主进程）
+  pgrep -af "tsx.*gateway/server.ts" | awk 'NR==1{print $1}' > "$TDAI_HOME/core.pid"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:8420/health || echo 000)
+  echo "  core pid=$(cat "$TDAI_HOME/core.pid") health=$code"
+}
+
+start_mock() {
+  if is_running "$TDAI_HOME/mock.pid"; then
+    echo "✓ mock 已在跑 (pid=$(cat "$TDAI_HOME/mock.pid"))"
+    return
+  fi
+  [[ -f "$TDAI_HOME/mock-upstream.mjs" ]] || { echo "⚠ mock-upstream.mjs 不存在，跳过（若上游已切 ducky 属正常）"; return; }
+  echo "→ 启动 mock (:8199)"
+  setsid nohup node "$TDAI_HOME/mock-upstream.mjs" >> "$TDAI_HOME/mock.log" 2>&1 </dev/null &
+  disown
+  sleep 1
+  pgrep -af "mock-upstream.mjs" | awk 'NR==1{print $1}' > "$TDAI_HOME/mock.pid"
+  echo "  mock pid=$(cat "$TDAI_HOME/mock.pid")"
+}
+
+start_proxy() {
+  if is_running "$TDAI_HOME/proxy.pid"; then
+    echo "✓ proxy 已在跑 (pid=$(cat "$TDAI_HOME/proxy.pid"))"
+    return
+  fi
+  echo "→ 启动 proxy (:8096)"
+  cd "$REPO/MemoryProxy" || exit 1
+  setsid nohup node --import tsx/esm src/index.ts --config "$TDAI_HOME/proxy.yaml" \
+    >> "$TDAI_HOME/proxy.log" 2>&1 </dev/null &
+  disown
+  sleep 4
+  pgrep -af "node.*--import tsx/esm.*src/index.ts.*proxy.yaml" | awk 'NR==1{print $1}' > "$TDAI_HOME/proxy.pid"
+  echo "  proxy pid=$(cat "$TDAI_HOME/proxy.pid")"
+}
+
+start_core
+start_mock
+start_proxy
+echo
+echo "─── 快速健康 ───"
+curl -sS -o /dev/null -w "core=%{http_code}\n" --max-time 3 http://127.0.0.1:8420/health
+curl -sS -o /dev/null -w "proxy=%{http_code}\n" --max-time 3 http://127.0.0.1:8096/ 2>/dev/null || echo "proxy 无根路由 = 404 正常"
+SH
+chmod +x ~/.tdai-lab/start-all.sh
+```
+
+**Step 3：写 `~/.tdai-lab/stop-all.sh`**（按 pid 逐个杀，找不到 pid 就用 pgrep 兜底）
+
+```sh
+cat > ~/.tdai-lab/stop-all.sh <<'SH'
+#!/usr/bin/env bash
+# 停止 core + mock + proxy。按 pid 文件先杀，杀不干净的用 pgrep 兜底。
+set -u
+TDAI_HOME="$HOME/.tdai-lab"
+
+kill_by_pidfile() {
+  local pidfile="$1" label="$2"
+  if [[ -s "$pidfile" ]]; then
+    local pid; pid=$(cat "$pidfile")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "→ 停 $label (pid=$pid)"
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    else
+      echo "✓ $label 已不在（pid=$pid 无效）"
+    fi
+    rm -f "$pidfile"
+  else
+    echo "✓ $label 无 pid 文件"
+  fi
+}
+
+kill_by_pattern() {
+  local pattern="$1" label="$2"
+  local pids
+  pids=$(pgrep -af "$pattern" | awk '{print $1}' | tr '\n' ' ')
+  if [[ -n "${pids// /}" ]]; then
+    echo "→ 兜底杀 $label: $pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+  fi
+}
+
+kill_by_pidfile "$TDAI_HOME/proxy.pid" proxy
+kill_by_pidfile "$TDAI_HOME/mock.pid"  mock
+kill_by_pidfile "$TDAI_HOME/core.pid"  core
+
+# 兜底：如果 pid 文件对不上（比如手工起过），按命令行特征清一遍
+kill_by_pattern "node.*--import tsx/esm.*src/index.ts.*proxy.yaml" proxy
+kill_by_pattern "mock-upstream.mjs" mock
+kill_by_pattern "tsx.*gateway/server.ts" core
+
+echo
+echo "─── 剩余相关进程（应为空）───"
+ps -ef | grep -E "tsx.*gateway/server|mock-upstream|--import tsx/esm.*src/index" | grep -v grep || echo "无残留"
+SH
+chmod +x ~/.tdai-lab/stop-all.sh
+```
+
+**Step 4：写 `~/.tdai-lab/status-all.sh`**（一眼看清三件是不是都活着）
+
+```sh
+cat > ~/.tdai-lab/status-all.sh <<'SH'
+#!/usr/bin/env bash
+# 打印 core/mock/proxy 的进程 + 端口 + 健康状态。
+# 端口探活统一用 curl（有些精简 shell 里没 ss/netstat）
+set -u
+TDAI_HOME="$HOME/.tdai-lab"
+
+probe() {
+  local url="$1"
+  curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "$url" 2>/dev/null || echo 000
+}
+
+check() {
+  local label="$1" pidfile="$2" pattern="$3" port="$4" health_url="$5"
+  local pid=""
+  [[ -s "$pidfile" ]] && pid=$(cat "$pidfile")
+  local alive="✗"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    alive="✓"
+  else
+    pid=$(pgrep -af "$pattern" | awk 'NR==1{print $1}')
+    [[ -n "$pid" ]] && alive="✓(pattern)"
+  fi
+  # 端口探活：curl 探根路径，任何 HTTP 响应（含 4xx）都说明端口活着；只有 000 才算死
+  local port_code
+  port_code=$(probe "http://127.0.0.1:$port/")
+  local port_open
+  if [[ "$port_code" == "000" ]]; then port_open="✗"; else port_open="✓"; fi
+  # 健康：有 health_url 走它，否则用端口探活的结果
+  local http_code="$port_code"
+  [[ -n "$health_url" ]] && http_code=$(probe "$health_url")
+  printf "%-6s alive=%s pid=%-8s port(:%s)=%s http=%s\n" "$label" "$alive" "${pid:-N/A}" "$port" "$port_open" "$http_code"
+}
+
+check core  "$TDAI_HOME/core.pid"  "tsx.*gateway/server.ts"                        8420 http://127.0.0.1:8420/health
+check mock  "$TDAI_HOME/mock.pid"  "mock-upstream.mjs"                             8199 ""
+check proxy "$TDAI_HOME/proxy.pid" "node.*--import tsx/esm.*src/index.ts.*proxy.yaml" 8096 ""
+SH
+chmod +x ~/.tdai-lab/status-all.sh
+```
+> ★端口探活用 curl 不用 `ss`：受限环境（如某些容器）里可能没 `ss` / `netstat`；curl 处处有。任何 HTTP 响应（含 404/401）都说明端口活着，只有 curl 自身返 000（连不上）才算死。
+
+**Step 5：日常使用**
+
+```sh
+~/.tdai-lab/start-all.sh    # 拉起（幂等，可反复跑）
+sleep 10                    # ★冷启动必须等（原因见下）
+~/.tdai-lab/status-all.sh   # 看健康——以这个为准
+~/.tdai-lab/stop-all.sh     # 全停
+```
+
+关掉/切换任意终端窗口都不影响这三个进程——它们的父 pid 会变成 1（init 接管），跟 shell 完全解耦。**注意**：机器重启后**不会自动拉起**，需要手动跑一次 `start-all.sh`；本机容器不支持 systemd（原因见「补充 §8b」），此为已知限制。
+
+> ★★**start-all.sh 输出里的 `core health=000000` 是已知误报，不是故障**。原因：脚本自带的探测在 core fork 后仅 sleep 5s 就 curl `/health`，而实测冷启动 tsx loader 的首次编译要 8~10s 才 listen 端口，所以 `core=000` **必然**出现在 start-all 的输出里。**判定 core 死活以 `status-all.sh`（前置 `sleep 10`）为准**，不要根据 start-all 的 000 就下结论说 core 挂了。如果 status-all 里 core 依然是 000，那才是真挂——去 `tail -50 ~/.tdai-lab/memory-core.log` 看堆栈。
+
+---
+
+### 3.5 打上 3 行 Bearer fork（ducky 上游必须做，否则 §5.2 会 502/token error）★2026-09-16 首装实测追加
+
+**为什么必须做**：`MemoryProxy/src/anthropicHandler.ts` 的 `buildUpstreamHeaders` 出站时把 `upstream.apiKey` 写成 `x-api-key`；但 **ducky 上游是 Bearer-only**（`x-api-key` 头它不看），必然 502 / `get token from header error`。3 行 patch 把出站 header 从 `x-api-key` 改成 `Authorization: Bearer`。**原理与升级合并策略见「补充 §16」**。
+
+**注意**：此步只在**接真 ducky（§5）**时必要；§4 用 mock 上游时 mock 两种 header 都收，做不做都行。**但强烈建议在此就打上**——一次到位，后面切 ducky 时不用回来补。
+
+**Step 1：判定当前源码是否已打过 patch**（可能 upstream 未来自己改过，先看看）
+```sh
+grep -n 'authorization.*Bearer.*effectiveApiKey' \
+  /home/admin/workspace/install/TencentDB-Agent-Memory/MemoryProxy/src/anthropicHandler.ts
+```
+- 有输出 → 已 patch，跳过 Step 2/3，直接进 §4。
+- 无输出 → 未 patch，跑 Step 2。
+
+**Step 2：备份 + patch**
+```sh
+HANDLER=/home/admin/workspace/install/TencentDB-Agent-Memory/MemoryProxy/src/anthropicHandler.ts
+cp "$HANDLER" "${HANDLER}.bak-preforkBearer-$(date +%Y%m%d)"
+
+# 精确匹配那 3 行 —— 若匹配失败说明 upstream 改过，不要瞎搞，回补充 §16 手工比对
+python3 - <<'PY'
+import re, os
+p = os.path.expanduser("~/workspace/install/TencentDB-Agent-Memory/MemoryProxy/src/anthropicHandler.ts")
+s = open(p).read()
+old = '''  if (effectiveApiKey && !target.authHeaders) {
+    headers["x-api-key"] = effectiveApiKey;
+    delete headers["authorization"];
+  }'''
+new = '''  // ★ tdai-lab fork: ducky 上游是 Bearer-only（x-api-key 会 401 / get token from header error），
+  //   出站用 Authorization: Bearer 替代 x-api-key。见 补充说明 §16。
+  if (effectiveApiKey && !target.authHeaders) {
+    headers["authorization"] = `Bearer ${effectiveApiKey}`;
+    delete headers["x-api-key"];
+  }'''
+if old not in s:
+    print("❌ 匹配失败：源码可能已改过或版本不同，请手工按补充 §16 比对")
+    raise SystemExit(1)
+open(p, "w").write(s.replace(old, new))
+print("✅ patch 完成")
+PY
+```
+
+**Step 3：patch 后重启 proxy**
+```sh
+~/.tdai-lab/stop-all.sh && ~/.tdai-lab/start-all.sh && sleep 10 && ~/.tdai-lab/status-all.sh
+# 期望：core=200 mock=200 proxy=404
+```
+
+**Step 4：验证 patch 已生效**
+```sh
+grep -n 'authorization.*Bearer.*effectiveApiKey' \
+  /home/admin/workspace/install/TencentDB-Agent-Memory/MemoryProxy/src/anthropicHandler.ts
+# 期望：能看到一行 headers["authorization"] = `Bearer ${effectiveApiKey}`;
+```
+
+> ★未来 `git pull` MemoryProxy 后请回来看：如果 upstream 自己已经改成 Bearer 或加了配置开关，删掉 fork；否则重新跑 Step 2 覆盖回去（补充 §16 有对照）。
+
+---
+
+## 4. 验证记忆闭环（核心：「有没有感」）
+
+### 4-前置：确认 upstream 是 mock（★首次或从 §5 回退时必看）
+
+**为什么**：§4 全流程用的是 `$FAKE="sk-ducky-FAKE-TOKEN"` 假 Bearer，它只在 mock 上游下能过（mock 不校验 token，任何值都 200）。若 proxy.yaml 的 `upstream.url` 已经改成真 ducky（`https://ducky.code.alibaba-inc.com/proxy/v1`，§5.1 会改），发假 token 上去 **必然 401**。
+
+**判断当前 upstream 是不是 mock**：
+```sh
+grep -E "^\s*url:" ~/.tdai-lab/proxy.yaml
+```
+- 若输出含 `127.0.0.1:8199` → **是 mock，直接进 §4.0**。
+- 若输出含 `ducky.code.alibaba-inc.com` → **是真 ducky，先跑下面的"切回 mock"**。
+
+**切回 mock**（直接把 upstream.url 写成 mock 目标值 + 重启 proxy）：
+```sh
+# 1. 把 upstream.url 强制改成 mock（幂等，无论当前是什么值都能到位；不依赖备份）
+sed -i.bak -E 's|^(\s*url:).*|\1 "http://127.0.0.1:8199"  # ★§4 期间用 mock；§5 需切回 ducky（见 §5.1）|' ~/.tdai-lab/proxy.yaml
+grep -E "^\s*url:" ~/.tdai-lab/proxy.yaml   # 校验：应显示 127.0.0.1:8199
+
+# 2. 只重启 proxy（core / mock 保持运行；重启 proxy 让新 upstream 生效）
+~/.tdai-lab/stop-all.sh && ~/.tdai-lab/start-all.sh && sleep 10 && ~/.tdai-lab/status-all.sh
+# 期望：core=200 mock=200 proxy=404
+```
+
+> **本节到这里结束**——两步跑完就进 §4.0。切回 ducky 是**几个小时后 §4 全绿要进 §5 时**的动作，见 §5.1，届时按文档流程自然会走到。
+
+---
+
+### 4.0 数据清零重跑（可选，仅在需要"从头再来"时执行）
+
+**什么时候要来这一步**：
+- 上一轮实验结果异常（画像退化 / 抽取全空 / 上游拼错等），怀疑数据/日志已被污染
+- 想换一批测试语料重跑一次
+- 换过 proxy.yaml 里的关键参数（如 `promptMode`、`user_id`、`serviceId`、上游 URL 等）后想重置基线
+
+**清零范围表**（严格执行，别删多也别删少）：
+
+| 类别 | 路径 | 动作 | 原因 |
+|---|---|---|---|
+| L0/L1/L2/L3 沉淀数据 | `~/.tdai-lab/data/` | **删** | 这是要重置的目标 |
+| 三份日志 | `~/.tdai-lab/*.log`（core/proxy/mock） | **删** | 旧日志混着看会误导 |
+| proxy 配置 | `~/.tdai-lab/proxy.yaml` | **保留** | 上游 URL / 身份注入等已调好，别打回原形 |
+| admin 密钥 | `~/.tdai-lab/user.key` | **保留** | 删了要重跑 §2.2 init-admin |
+| ducky token | `~/.tdai-lab/ducky.token` | **保留** | §5.2 冒烟要用 |
+| 常驻脚本 | `~/.tdai-lab/{start,stop,status}-all.sh` | **保留** | 工具链，无需重建 |
+| 源码 + 依赖 | `~/workspace/install/TencentDB-Agent-Memory/` | **保留** | 重装 node_modules 极贵 |
+
+**执行**：
+```sh
+# 1. 停三件套
+~/.tdai-lab/stop-all.sh
+
+# 2. 备份（可选，怕丢老数据就先备一份，2 秒的事）
+tar czf ~/tdai-lab-backup-$(date +%s).tar.gz -C ~/.tdai-lab data 2>/dev/null
+ls -la ~/tdai-lab-backup-*.tar.gz | tail -1
+
+# 3. 清零 data + logs
+rm -rf ~/.tdai-lab/data
+rm -f  ~/.tdai-lab/memory-core.log ~/.tdai-lab/proxy.log ~/.tdai-lab/mock-upstream.log
+
+# 4. 校验：保留项都在
+ls -la ~/.tdai-lab/proxy.yaml ~/.tdai-lab/user.key ~/.tdai-lab/ducky.token \
+        ~/.tdai-lab/start-all.sh ~/.tdai-lab/stop-all.sh ~/.tdai-lab/status-all.sh
+```
+
+**重启并校验空数据基线**：
+```sh
+# 5. 启动
+~/.tdai-lab/start-all.sh
+
+# 6. 等 ~10s 让 core 完全 warm 起来（start-all 内部 sleep 5s，实测冷启动 tsx loader 需要更久）
+sleep 10
+
+# 7. 三件套健康
+~/.tdai-lab/status-all.sh
+# 期望：core=200, mock=200, proxy=404（proxy 根路径没路由，404 是活的证据）
+
+# 8. core 核对：确认沉淀真的清空了（应返 items:[]）
+curl -sS -X POST http://127.0.0.1:8420/v3/atomic/search \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -H "authorization: Bearer $(cat ~/.tdai-lab/user.key)" \
+  -d '{"query":"provider","team_id":"tdai-lab","user_id":"u_debug","agent_id":"brain"}' \
+  | head -c 400; echo
+
+# 9. persona 也应不存在（清完还没喂对话，L3 未生成）
+ls ~/.tdai-lab/data/profiles/ 2>&1 | head -5
+# 期望：目录不存在或为空 —— 后续 §4.1 喂完对话由 core 自建
+```
+
+**若第 7 步 status 不全绿**：
+- core=000 → `tail -50 ~/.tdai-lab/memory-core.log` 看启动堆栈
+- proxy=000 → `tail -50 ~/.tdai-lab/proxy.log` 看是否配置解析失败
+- 常见坑：见「补充 §7 / §8b / §13」
+
+**第 8 步 items 非空**：数据没清干净——回到第 3 步再删一次，确认 `~/.tdai-lab/data` 已彻底消失（不是空目录，是**不存在**）。
+
+**★确认全绿后**，才进 §4.1。
+
+---
+
+### 4.1 喂几轮可沉淀的对话（通过 proxy）
+```sh
+FAKE="sk-ducky-FAKE-TOKEN"      # 验证期随便一个 Bearer；透传给 mock，不接触真 ducky
+send() { curl -sS -X POST http://127.0.0.1:8096/claude-code/default/v1/messages \
+  -H "content-type: application/json" -H "authorization: Bearer $FAKE" -H "x-session-id: $1" \
+  -d "$2" -o /dev/null -w "[$1 HTTP %{http_code}]\n"; }
+
+send sess-1 '{"model":"claude-opus-4-8","max_tokens":64,"system":"You are Claude Code.","messages":[{"role":"user","content":"我叫银时，我只有 idealab 一个 key，禁止建议我切换 provider。"}]}'
+send sess-1 '{"model":"claude-opus-4-8","max_tokens":64,"system":"You are Claude Code.","messages":[{"role":"user","content":"记住这条偏好。"}]}'
+send sess-1 '{"model":"claude-opus-4-8","max_tokens":64,"system":"You are Claude Code.","messages":[{"role":"user","content":"以后新项目也照这个来。"}]}'
+```
+> ★请求必须带 `system` 字段——注入只往 system 里塞，无 system 时是空操作（见「补充 §5」）。
+
+### 4.2 确认 L0 落盘 + L1 已抽取
+
+L0（原始对话落盘）是**同步**的，§4.1 一跑完就能看到；L1（原子卡片抽取）是**后台异步**——core 攒够 `everyNConversations` 轮或空闲 flush 后才起 idealab Qwen LLM 抽取，**单次 5~30s，多次并发可能串行**。所以本节拆两段：立即验 L0，等 30s 再验 L1。
+
+#### 4.2a 立即验 L0 落盘（§4.1 结束就跑）
+```sh
+# ★grep 必须带 -a：memory-core.log 里夹了非文本字节，不加 -a 只会打印 "binary file matches" 不显示行
+grep -aiE "conversation/add|L0-upsert" ~/.tdai-lab/memory-core.log | tail -10
+```
+> **期望**：至少 3 行 `conversation/add` 或 `L0-upsert`（§4.1 喂了 3 条就对应 3 行）。这一步能过 = L0 落盘 OK。
+>
+> **此刻 `atomic/search` 大概率返 `items:[]`——这不是失败**，L1 还没抽完，见 §4.2b。
+
+#### 4.2b 等 30s 再验 L1 抽取 + 具体原子内容
+```sh
+sleep 30    # ★必须等：idealab Qwen 抽 1 个 L1 卡片实测 5~22s，多个并发时更久
+
+# ① 看 L1 抽取日志是否出现
+grep -aiE "Extraction complete|L1 complete|extracted=[0-9]|stored=[0-9]" ~/.tdai-lab/memory-core.log | tail -10
+
+# ② 直接查原子数（走 core，用 admin key）
+# ★三元组身份：team_id/agent_id 来自 proxy.yaml sessionInit.debugForceIdentity；
+#   user_id 未在 debugForceIdentity 里显式设，proxy 默认落 "u_debug"（这是 core 侧记忆的命名空间键，
+#   跟 admin sk-mem 的鉴权 uid 是两个域，别混淆——见「补充 §5.2」）。
+curl -sS -X POST http://127.0.0.1:8420/v3/atomic/search \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -H "authorization: Bearer $(cat ~/.tdai-lab/user.key)" \
+  -d '{"query":"provider 切换","team_id":"tdai-lab","user_id":"u_debug","agent_id":"brain"}' \
+  | head -c 1500; echo
+```
+
+**期望（同时满足才算 §4.2 全绿）**：
+- ① grep 至少能看到一行 `Extraction complete: extracted=N` 或 `L1 complete: extracted=N stored=N`（N≥1）；
+- ② `atomic/search` 返回的 items 数组**非空**，且至少各命中一条以下形态（内容可以是同一个语义的不同表述，不需要字面完全一致）：
+  - **instruction 原子**：内容提及"provider"或"idealab"，语义上表达"不要建议切换 provider" / "只有 idealab 一个 key"，例如
+    > "用户（银时）要求 AI 以后不要建议其切换 provider，因为用户只有 idealab 一个 key……"
+  - **persona 原子**：内容提及用户的名字**银时**，例如
+    > "用户（银时）的名字是银时。"
+- 每条原子的身份字段必须是 `team_id=tdai-lab / user_id=u_debug / agent_id=brain`——否则说明落到错的命名空间，回头查 proxy.yaml 的 `debugForceIdentity`。
+
+**若 `items:[]` 且 grep 也没看到 `Extraction complete`**：
+- 再 `sleep 60` 补等一次（Qwen 偶发排队）；
+- 仍无 → 看 core log 尾巴有没有 `idealab` / `429` / `rate limit` / `LLM extraction failed` —— 触发限流或 LLM 报错才是**真失败**（见「补充 §5.2 附坑 C」区分"async 未到"和"真失败"的判据）。
+
+### 4.3 ★跨会话召回注入（决定性验证）
+开一个**全新 session**，看历史 L3 画像是否被自动注入 system：
+```sh
+curl -sS -X POST http://127.0.0.1:8096/claude-code/default/v1/messages \
+  -H "content-type: application/json" -H "authorization: Bearer $FAKE" -H "x-session-id: sess-NEW" \
+  -d '{"model":"claude-opus-4-8","max_tokens":64,"system":"You are Claude Code.","messages":[{"role":"user","content":"建议我换个 provider 吗？"}]}' -o /dev/null -w "[HTTP %{http_code}]\n"
+# 看转发到上游的请求体：应从百来字节暴涨到上万字节，且含历史画像
+wc -c ~/.tdai-lab/mock-lastbody.json
+grep -aoE "银时|idealab|不要建议|tdai_profile_memory|Narrative Profile" ~/.tdai-lab/mock-lastbody.json | sort | uniq -c
+```
+> 预期：body 明显变大，grep 命中「银时」「idealab」等——**新会话从没提过这些 = L3 被自动召回注入**，跨会话记忆成立。
+
+### 4.4 主动召回通道（L1 按需检索）
+```sh
+curl -sS -X POST http://127.0.0.1:8096/memory-bridge/v3/atomic/search \
+  -H "content-type: application/json" -H "authorization: Bearer $FAKE" -H "x-session-id: sess-NEW" \
+  -d '{"query":"用户能不能切换 provider"}' -w "\n[HTTP %{http_code}]\n" | head -c 800
+```
+> 预期 HTTP 200，返回归属 `team=tdai-lab/user=u_debug/agent=brain` 的原子记忆。bridge 自动注身份，无需你带 sk-mem。
+
+### 4.5 用 read-local-memory 人工核对沉淀质量
+```sh
+cd ~/workspace/install/TencentDB-Agent-Memory/MemoryCore
+npm run build:read-local-memory                              # 首次需编译
+# CLI 认 -d 参数，不认 TDAI_DATA_DIR 环境变量；必须显式传路径
+node ./bin/read-local-memory.mjs -d ~/.tdai-lab/data           # 概览：L0/L1/L2/L3 各多少
+node ./bin/read-local-memory.mjs -d ~/.tdai-lab/data -L L1     # 看 L1 原子明细
+node ./bin/read-local-memory.mjs -d ~/.tdai-lab/data -L L0 -l 20  # 看 L0 对话流水
+```
+> ⚠️ CLI 概览里 L2/L3 会显示 0/不存在——**不是没抽出来**，是 CLI 找的路径与 core 多租户目录布局不匹配（详见「补充 §8」）。直接 `cat` 也能看：
+> ```sh
+> cat ~/.tdai-lab/data/profiles/team%3Atdai-lab%7Cagent%3Abrain/persona.md
+> ls  ~/.tdai-lab/data/profiles/team%3Atdai-lab%7Cagent%3Abrain/scene_blocks/
+> ```
+> **判据**：抽出的原子是否准确、新会话是否真的「记得」——这就是「有没有感」的答案。
+
+#### 4.5 CLI 输出的期望形态（首装 mock 阶段）
+喂完 §4.1 的 3 轮 + 等过 30s 后，CLI 概览的**预期**：
+- **L0 · conversations 总条数：≥6**（3 条 user + 至少 3 条 assistant——若中途还试跑过 §4.3 则更多，如 8 条）；`角色分布` 里 user/assistant 应大致等比。
+- **L1 · records 总条数：≥2**，`类型分布` 至少含 `instruction: 1`（"不要建议切 provider"）+ `persona: 1`（"名字是银时"）——如果 L1 抽了多次，可能出现 3 条或更多同类型条目，正常。
+- **L2 · scene_blocks 文件数：0**（scene block 由 core 在 L1 累积到一定量后触发生成，2 条 L1 不够，正常）。
+- **L3 · persona 文件不存在**（L3 大约要 50 条新 L1 才触发生成——首装远不够，正常。当前 §4.3 里注入到 system 的 `Narrative Profile` 是 core 从当前小样本 L1 现算的实时视图，不是持久化的 persona.md）。
+
+`-L L1` 明细里 content 至少应各出现一行满足：
+- 一行 type=`instruction`、content 含 "provider" 或 "idealab"；
+- 一行 type=`persona`、content 含 "银时"。
+
+> 「L2=0 / L3 不存在」**不是问题**——首装样本量的正常状态。真判定看 L0/L1 的内容质量 + §4.3 的 mock-lastbody grep 命中数。
+
+---
+
+## 5. 接入主 CC（可逆切换）★动主 CC 前必读「补充 §11」
+
+> ⚠️ 这一步改的是主 CC 的上游路由。**先备份、可秒回退**，保留 ducky 直连作为生命线。**不确定就先别做，只在 POC 隔离环境体验够了再接。**
+
+> **§5 的章节流水线**：`5.0 自检 db 里是否已有 user` → `5.1 切 upstream 到真 ducky` → `5.2 手工 curl 冒烟` → `5.3 把主 CC 指向 proxy`。每一节的**前置动作**都紧贴在该节前面（不再有游离的 "5.0 前置" 块）。
+
+### 5.0 自检 db 里是否已有 user，无则补跑 §2.2 init-admin ★2026-09-16 首装实测追加
+
+**为什么必看**：§5.2 冒烟里出现 `unauthorized: invalid_user_key` + `FOREIGN KEY constraint failed` 一路涨的**首要根因**——不是 key 错、不是 proxy 头错，而是 core 的 `meta_users` 表是空的。可能触发原因：§2.2 的 curl 返回了非 200（比如 db 目录被清、Bearer gate 未关等）但 `~/.tdai-lab/user.key` 已经本地写好，看起来没错但那把 key 从没在 db 里落地。详见「补充 §17」。
+
+**Step 1：自检 db 里有没有 user**
+```sh
+DB=~/.tdai-lab/data/metadata/tdai_metadata_default/metadata.db
+sqlite3 "$DB" "SELECT count(*) AS users FROM meta_users; SELECT count(*) AS keys FROM meta_user_keys;"
+# 期望：users=1 keys=1（或更多）；出现 users=0 → 走 Step 2 补跑 init-admin
+```
+
+**Step 2（仅当 users=0 时执行）：重跑 §2.2 init-admin**
+```sh
+# ★用 ~/.tdai-lab/user.key 里已有的 key 固定传入，避免生成新 key 让 §5.1/§5.2 已建好的 cc-authtoken.sk-mem 对不上
+KEY=$(cat ~/.tdai-lab/user.key)
+[ -n "$KEY" ] || { echo "❌ ~/.tdai-lab/user.key 为空，重新生成："
+  KEY="sk-mem-$(openssl rand -base64 48 | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32)"
+  umask 077; printf '%s' "$KEY" > ~/.tdai-lab/user.key
+  echo "已生成并存回 ~/.tdai-lab/user.key"
+}
+
+RESP=$(curl -sS -X POST http://127.0.0.1:8420/v3/internal/meta/user/init-admin \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -d "$(printf '{"username":"admin","user_key":"%s"}' "$KEY")")
+echo "$RESP"
+# 期望 code=0（成功）；code=409 already_initialized → 说明 db 里其实有别的 admin key，不是你本地这把 → 走 Step 3 诊断
+```
+
+**Step 3：验证 key 可用**
+```sh
+KEY=$(cat ~/.tdai-lab/user.key)
+curl -sS -X POST http://127.0.0.1:8420/v3/meta/auth/verify \
+  -H "Content-Type: application/json" -H "x-tdai-service-id: default" \
+  -H "x-tdai-user-key: $KEY" \
+  -d "$(printf '{"user_key":"%s"}' "$KEY")"
+# 期望：{"data":{"valid":true,"user":{...}}}
+# 若仍 valid=false：
+#   a) Step 2 是否 200？没 200 就再跑一次；
+#   b) core 是否真在运行？curl http://127.0.0.1:8420/health；
+#   c) 极端情况可整目录清零 db 后重来（★破坏 §4 已有沉淀，谨慎）：
+#      ~/.tdai-lab/stop-all.sh && rm -rf ~/.tdai-lab/data && ~/.tdai-lab/start-all.sh && sleep 8
+#      再从本节 Step 2 重跑
+```
+
+**Step 4：同步 cc-authtoken.sk-mem（如果之前已建过）**
+```sh
+# §5.2 Step 1 会做同样的事，这里做一次是为让 §5.0 自成闭环——单跑本节即可先验一遍链路
+umask 077
+cp ~/.tdai-lab/user.key ~/.tdai-lab/cc-authtoken.sk-mem
+wc -c ~/.tdai-lab/cc-authtoken.sk-mem
+```
+
+**5.0 通过判据**：`sqlite3 count` 至少 users=1、`auth/verify` 返回 `valid:true`。**通过后继续 §5.1；不通过就别往下走**，往下所有 `/v3/meta/*` 请求都会 401。
+
+### 5.1 上游切到真 ducky（原 §4 是 mock，本节切走）
+
+**为什么**：§4 用假 token + mock 上游跑记忆闭环；进 §5 要接主 CC，就必须让 proxy 上游指向**真 ducky**（否则挂上来 CC 收到的是 mock 假响应，没意义）。
+
+**先看当前 upstream 是什么**：
+```sh
+grep -E "^\s*url:" ~/.tdai-lab/proxy.yaml
+```
+- 含 `ducky.code.alibaba-inc.com` → 已经是 ducky，**跳过下面的 sed，直接跑重启 + 验证**。
+- 含 `127.0.0.1:8199` → 当前是 mock，**跑下面的 sed 切走**。
+- 其它值（自定义上游 / 空 / 缺 `/v1`）→ 同样跑下面的 sed，会强制到位。
+
+**切到真 ducky**（直接改 proxy.yaml + 重启 proxy）：
+
+**⚠️ 关键（首装必看）**：`upstream.apiKey` 必须**灌 ducky token**，不能留空。留空时 proxy 会透传客户端入站 Bearer 作为出站 Authorization——那样一来客户端就必须把 ducky token 塞进 `ANTHROPIC_AUTH_TOKEN`，而客户端 Bearer 又会被 proxy 强制当成 sk-mem key 送到 core `/v3/meta/*`，造成 core 全 401、hook-cache FK 失败（详见「补充 §15」）。**正确摆放：ducky token 放 `upstream.apiKey`；客户端 `ANTHROPIC_AUTH_TOKEN` 放 sk-mem key（=`~/.tdai-lab/user.key`）**。
+
+```sh
+# 1. 幂等把 upstream.url 写成真 ducky（无论当前是什么值，一次到位）
+#    ★URL 必须带 /v1——proxy 内部会砍 /v1 再拼上游，缺 /v1 会 502（见「补充 §13」）
+#    ★换其它 anthropic gateway 时，把这里 URL 换成对应基址（同样须带 /v1 或等价前缀）
+sed -i.bak -E 's|^(\s*url:).*|\1 "https://ducky.code.alibaba-inc.com/proxy/v1"  # ★带 /v1；见「补充 §13」|' ~/.tdai-lab/proxy.yaml
+grep -E "^\s*url:" ~/.tdai-lab/proxy.yaml   # 校验：应显示 ducky.code.alibaba-inc.com/proxy/v1
+
+# 2. 把 ducky token 灌进 upstream.apiKey（见「补充 §15」）
+#    ANTHROPIC_AUTH_TOKEN 环境变量此刻要是你的 ducky token（首次源自 zshrc 里的生命线）
+[ -n "$ANTHROPIC_AUTH_TOKEN" ] || { echo "❌ ANTHROPIC_AUTH_TOKEN 为空，先 source ~/.zshrc"; return 1; }
+python3 - <<PY
+import yaml, os
+p = os.path.expanduser("~/.tdai-lab/proxy.yaml")
+d = yaml.safe_load(open(p))
+d["upstream"]["apiKey"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+open(p, "w").write(yaml.safe_dump(d, allow_unicode=True, sort_keys=False))
+print("upstream.apiKey len =", len(d["upstream"]["apiKey"]))
+PY
+
+# 3. 重启 proxy 让改动生效
+~/.tdai-lab/stop-all.sh && ~/.tdai-lab/start-all.sh && sleep 10 && ~/.tdai-lab/status-all.sh
+# 期望：core=200 mock=200 proxy=404
+```
+
+**5.1 验证：proxy 已切上游且真的连通 ducky**
+```sh
+# ① 进程存活 + 命令行还是 tsx 跑 src/index.ts
+ps -p $(cat ~/.tdai-lab/proxy.pid) -o pid,cmd
+# ② 日志里 upstream 已切 ducky，且 connectivity.check 里 upstream=ok
+grep -aE "server.starting|server.listening|connectivity.check" ~/.tdai-lab/proxy.log | tail -5
+```
+> 预期见到（关键三行）：
+> - `server.starting ... "upstream":"https://ducky.code.alibaba-inc.com/proxy"`
+> - `server.listening {"address":"127.0.0.1","port":8096}`
+> - `connectivity.check ... "upstream":"ok (XXms)"`（← 这行是 proxy 已实测 ping 通 ducky 的关键证据）
+>
+> ⚠️ `creditReport: FAIL: fetch failed` **正常忽略**——那是 costGuard 的额度探测，我们 `costGuard.enabled:false` 已关。
+> ⚠️ `upstream: FAIL` 才是真出事：多半是网络到 ducky 不通 / DNS / 证书问题，得先修网络再挂 CC。
+
+### 5.2 手工冒烟：先 curl 打一遍，别急着挂 CC（三条硬约束）★强烈建议
+
+直接 `claude` 挂进来出问题不好排查——上游从 mock 换成真 ducky 后，路径上多了三个变量：ducky 侧鉴权、透传路径、tdai 注入是否仍生效。用 curl 先冒烟一遍，三条判据全绿再挂 CC。
+
+**三条硬约束**（每次接主 CC 前重读一次）：
+1. **入站 Bearer 必须是 sk-mem key**（不是 ducky token！ducky token 已经在 §5.1 灌进 `upstream.apiKey` 了，出站到 ducky 由 proxy 自己覆盖 Authorization）。详见「补充 §15」。
+2. **绝不写 `~/.zshrc` / `~/.claude/settings.json` env 块**——只在**新起的一个 shell** 里 `export`，关掉即回退。主 CC 的其它 shell 全程直连 ducky，生命线不断（原理见「补充 §11」）。
+3. **新起 session id**（`sess-smoke-<时间戳>`），不复用 4.x 里的 `sess-1` / `sess-NEW`，避免既有 L3 画像干扰对新链路本身的判断——现在验的是「链路通不通」，不是「画像准不准」。
+
+**Step 1：把 sk-mem key 落到 CC 用的隔离文件**
+
+`~/.tdai-lab/user.key` 里已经有一个 tdai 自签发的 sk-mem key（安装时生成），CC 走 proxy 时用它作 `ANTHROPIC_AUTH_TOKEN`。复制成一个语义清晰的文件名（后续 §5.3 `claude-mem` 函数读它）：
+
+```sh
+umask 077
+cp ~/.tdai-lab/user.key ~/.tdai-lab/cc-authtoken.sk-mem
+wc -c ~/.tdai-lab/cc-authtoken.sk-mem            # 期望 ≥ 30 字节
+head -c 8 ~/.tdai-lab/cc-authtoken.sk-mem; echo  # 期望 sk-mem-（前 8 字节）
+```
+
+> ★为什么不是 ducky token？见「补充 §15」。一句话：proxy 会把入站 Bearer 强制当 sk-mem 送给 core 做 `x-tdai-user-key` 鉴权，ducky token 送过去 core 全 401、hook-cache FK 失败。**ducky token 只在 §5.1 一处出现（灌 `upstream.apiKey`），CC 侧永远不要用它当 Bearer**。
+
+**Step 2：走 proxy 打一次 ducky**
+```sh
+SKMEM=$(cat ~/.tdai-lab/cc-authtoken.sk-mem)
+SID="sess-smoke-$(date +%s)"          # 新 session，绕开老画像干扰
+
+curl -sS -X POST http://127.0.0.1:8096/claude-code/default/v1/messages \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $SKMEM" \
+  -H "x-session-id: $SID" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-opus-4-8",
+    "max_tokens": 512,
+    "system": "You are Claude Code.",
+    "messages": [{"role":"user","content":"用一句话告诉我：如果我遇到当前 provider 限流，你会建议我做什么？"}]
+  }' | tee ~/.tdai-lab/smoke-resp.json | head -c 1500; echo
+```
+
+**Step 3：五条判据**（全绿才进 5.3）
+```sh
+# 判据①  HTTP 层：response 有 content 字段（ducky 真回了内容）
+python3 -c "
+import json
+d = json.load(open('/home/admin/.tdai-lab/smoke-resp.json'))
+print('resp keys:', list(d.keys()))
+print('content preview:', str(d.get('content'))[:400])
+"
+# 判据②  注入层：proxy 日志里 tdai 应该 recall + inject 了
+grep -aiE "tdai|memory|inject|profile|recall" ~/.tdai-lab/proxy.log | tail -20
+# 判据③  沉淀层：core 日志应该看到本轮的 conversation/add
+grep -aiE "conversation/add|L0-upsert" ~/.tdai-lab/memory-core.log | tail -5
+# 判据④ core ACL 干净：proxy → core 无 401
+grep -acE "unauthorized: invalid_user_key" ~/.tdai-lab/proxy.log
+# 判据⑤ hook-cache 无外键失败
+grep -acE "FOREIGN KEY constraint failed" ~/.tdai-lab/proxy.log
+```
+
+**判定表**（五行都是"绿"才算 §5.2 全绿；任一"不绿"按最右列排查）：
+
+| 判据 | 看哪里 | 绿的标志 | 不绿 & 排查 |
+|---|---|---|---|
+| ① 链路 | 判据① python 输出 | `resp keys` 含 `content`；`content preview` 是一段自然语言答复 | 输出含 `type=error, 401` → 出站 401，先看 §5.1 是否已把 ducky token 灌进 `upstream.apiKey`（见「补充 §15」）<br>输出是 HTML `502 Bad Gateway` → upstream 缺 `/v1`，见「补充 §13」 |
+| ② 记忆内容 | 同上 `content preview` | 答复里**主动出现**"银时" / "idealab" / "不建议切换 provider" 中的至少一个 | 一个都没出现 → 画像没进上下文，转 Step 4 冷启 3 次判 §14 |
+| ③ 注入过 | 判据② grep 输出 | 有 `tdai_profile_memory` 关键字，且这行 preview 开头是 `<tdai_profile_memory>` | 只有 `<memory-tools-guide>` 开头，没有 `<tdai_profile_memory>` → 退化为工具指南，转 Step 4 <br>整个 grep 空 → tdai 注入器没跑，`curl http://127.0.0.1:8420/health` 看 core 死活 |
+| ④ 沉淀 | 判据③ grep 输出 | 至少 1 行 `conversation/add` 或 `L0-upsert`，且时间戳是刚才那次 curl 之后 | 完全无 → `tdai.memory.writeL0` 是否 `true`？查 proxy.yaml |
+| ⑤ core ACL | 判据④ grep 计数 | **必须 `0`** | 非 0 → CC 侧 Bearer 塞的不是 sk-mem key，见「补充 §15」+ §5.2 Step 1 |
+| ⑥ hook-cache | 判据⑤ grep 计数 | **必须 `0`** | 非 0 → session/agent 元数据没入库（几乎总跟 ⑤ 一起出现），修 ⑤ 即修 ⑥ |
+
+> ★"② 记忆内容"和"③ 注入过"看起来独立，实际强绑定：③ 是"proxy 有没有把画像塞给 ducky"（proxy 侧证据）、② 是"ducky 收到画像后有没有真用上"（ducky 侧证据）。**② 绿必然 ③ 绿**（能用起来说明塞进去了）；**③ 绿不一定 ② 绿**（塞进去了但 ducky 没主动引用也可能，取决于它怎么理解 system）。所以两个都要看。
+>
+> ★若 ③ 是 `<memory-tools-guide>`（工具指南）而不是 `<tdai_profile_memory>`（真画像）—— 这就是「补充 §14」记录的老 bug，唯一确诊动作是 **Step 4 冷启 3 次**。
+
+**Step 4：判据②hook preview 退化时的确诊动作（冷启动 3 次冒烟）** ★2026-09-15 首装实测追加
+
+若判据②发现 hook preview 开头是 `<memory-tools-guide>` 而不是 `<tdai_profile_memory>`（画像退化为工具指南），**唯一执行动作**：连做 3 次「冷启动 + 新 session id 冒烟」，观察退化是否稳定复现。原理与三种可能路径见「补充 §14」（已定位到 `tdai-profile-memory-injector.ts:82-90` 的 fallback 分支）。
+
+```sh
+SKMEM=$(cat ~/.tdai-lab/cc-authtoken.sk-mem)
+
+for i in 1 2 3; do
+  echo "=========== 第 $i 次冷启动 ==========="
+  ~/.tdai-lab/stop-all.sh
+  ~/.tdai-lab/start-all.sh                       # 内部会 sleep 5s 等 core ready 再起 proxy
+  sleep 3
+
+  SID="sess-smoke-cold-$i-$(date +%s)"           # ★必须每次不同 sid，避开 hook 的 session_init 缓存
+  echo "--- SID=$SID ---"
+
+  curl -sS -X POST http://127.0.0.1:8096/claude-code/default/v1/messages \
+    -H "content-type: application/json" \
+    -H "authorization: Bearer $DUCKY" \
+    -H "x-session-id: $SID" \
+    -H "anthropic-version: 2023-06-01" \
+    -d '{"model":"claude-opus-4-8","max_tokens":128,"system":"You are Claude Code.","messages":[{"role":"user","content":"ping"}]}' \
+    > /dev/null
+
+  sleep 2
+done
+
+# ★循环跑完后，一次性从 proxy.log 里捞真正的"内容标签"（tdai-profile-memory-injector 注入了啥）
+grep -aE 'text preview:.*(tdai_profile_memory|memory-tools-guide)' ~/.tdai-lab/proxy.log | tail -6
+```
+
+> ★别把 `<tdai_memory_tools>`（下划线）跟 `<memory-tools-guide>`（连字符）弄混——前者是另一个 hook 的正常输出，每次都有；后者才是退化标志。
+
+**判定规则**（数最后那句 grep 输出里的行数）：
+
+| `<tdai_profile_memory>` 行数 | `<memory-tools-guide>` 行数 | 判定 | 下一步 |
+|---|---|---|---|
+| 3 | 0 | ✅ **3/3 真画像**，§14 关闭 | 进 §5.3 |
+| 2 或 1 | 1 或 2 | ⚠️ 启动竞态确诊（session_init cache 固化了空 L3） | 把 `start-all.sh` 里 core→proxy 之间 `sleep 5` 改成 `sleep 20`，再冷启 3 次 |
+| 0 | 3 | ❌ 稳定退化，core 侧 L2/L3 读不到 | 加打印挖 `readL3ForCtx` / `listL2ForCtx`；不要进 §5.3 |
+
+**★除非表格里第一行「3/3 真画像」，不要进 §5.3**。
+
+### 5.2b 消除 `agent_not_found: brain` 404（可选清理，接主 CC 前建议做）★2026-09-16 首装实测追加
+
+**症状**：§5.2 冒烟通过后，`grep "kernel error" ~/.tdai-lab/proxy.log` 会看到：
+```
+[fixed-asset] kernel error, injecting only self: [metadata-client] /v3/meta/agent-fixed-asset/list-with-detail HTTP 404: {"code":404,"message":"agent_not_found: agent not found: brain"...}
+```
+主链路不受影响（injector 内置 fallback"只注入自己"），但每次请求都会打一次 404，日志脏，且 fixed-asset 关联能力废掉。
+
+**根因（两层，缺一不可）**：
+1. `~/.tdai-lab/proxy.yaml` 里 `sessionInit.debugForceIdentity` 硬编码了 `team_id: tdai-lab / agent_id: brain / task_id: validate` 作为**记忆命名空间三元组**（字符串标签，不是数据库主键），但 core `/v3/meta/agent-fixed-asset/list-with-detail` 走**数据库主键 `agent_id`** 查表——两者不是一个域。`init-admin` 已经自动建了默认 team + agent，用它们的**真实主键**回填 debugForceIdentity 即可。
+2. **【坑】proxy 有持久化会话状态目录** `~/.memory-tencentdb/proxy-state/nottl/default/<session-id>/binding.json`——每个 session 首次 init 后就把 `teamId/agentId` 钉在磁盘上，重启不清。代码分支 `session/claude-code/init.ts:631` `if (config.debugForceIdentity && (!state || state.status !== "initialized"))` **只对未初始化的 session 生效**；旧 sess-* 已经 `outcome:"initialized"` 了，改 yaml 完全被跳过。所以 Step 2 单独改 yaml 不够，**必须同步清掉 proxy-state 才能让新 session 走 debugForceIdentity 分支重新绑定**。
+
+**Step 1：从 db 读出真实的 team / agent / user 主键**
+```sh
+DB=~/.tdai-lab/data/metadata/tdai_metadata_default/metadata.db
+sqlite3 "$DB" "SELECT team_id, name FROM meta_teams;"
+sqlite3 "$DB" "SELECT agent_id, team_id, owner_user_id, name FROM meta_agents;"
+# 期望输出：
+#   team-xxxxxxxxxx|default-team
+#   agt-xxxxxxxxxx|team-xxxxxxxxxx|usr-xxxxxxxxxx|default-agent-admin
+```
+
+**Step 2：把 debugForceIdentity 改成 db 里的主键**
+```sh
+DB=~/.tdai-lab/data/metadata/tdai_metadata_default/metadata.db
+TEAM=$(sqlite3 "$DB" "SELECT team_id FROM meta_teams LIMIT 1;")
+AGENT=$(sqlite3 "$DB" "SELECT agent_id FROM meta_agents LIMIT 1;")
+echo "TEAM=$TEAM  AGENT=$AGENT"
+[ -n "$TEAM" ] && [ -n "$AGENT" ] || { echo "❌ team/agent 缺失，回 §5.0 补跑 init-admin"; return 1; }
+
+python3 - "$TEAM" "$AGENT" <<'PY'
+import sys, yaml, os
+team, agent = sys.argv[1], sys.argv[2]
+p = os.path.expanduser("~/.tdai-lab/proxy.yaml")
+d = yaml.safe_load(open(p))
+ident = d.setdefault("sessionInit", {}).setdefault("debugForceIdentity", {})
+ident["team_id"]  = team
+ident["agent_id"] = agent
+ident["task_id"]  = "validate"          # task_id 不入 db，保持字符串即可
+open(p, "w").write(yaml.safe_dump(d, allow_unicode=True, sort_keys=False))
+print("debugForceIdentity ->", ident)
+PY
+
+# 重启 proxy 生效
+~/.tdai-lab/stop-all.sh && ~/.tdai-lab/start-all.sh && sleep 8 && ~/.tdai-lab/status-all.sh
+```
+
+**Step 2.5：清空 proxy 持久化 session 状态（关键，不能省）**
+
+改完 yaml 之后必须清掉磁盘上已 initialized 的 session，否则 proxy 复用旧 binding.json 里的 `agentId:"brain"`，debugForceIdentity 分支**永远进不去**。
+
+```sh
+STATE=~/.memory-tencentdb/proxy-state/nottl
+# 先看一眼里面有多少历史 session（心中有数）
+find "$STATE" -name binding.json | wc -l
+# 抽样确认里头确实钉着 brain
+find "$STATE" -name binding.json -exec grep -l '"agentId":"brain"' {} \; | head -3
+
+# 停 proxy → 清目录 → 起 proxy（顺序不能反：proxy 运行中改这个目录，它会 flush 覆盖回去）
+~/.tdai-lab/stop-all.sh
+rm -rf "$STATE"
+~/.tdai-lab/start-all.sh && sleep 8 && ~/.tdai-lab/status-all.sh
+```
+
+**Step 3：验证 404 消失**
+```sh
+# 重放一次 §5.2 Step 2 curl（记得新 SID）
+SKMEM=$(cat ~/.tdai-lab/cc-authtoken.sk-mem)
+SID="sess-smoke-verify-$(date +%s)"
+curl -sS -X POST http://127.0.0.1:8096/claude-code/default/v1/messages \
+  -H "content-type: application/json" -H "authorization: Bearer $SKMEM" \
+  -H "x-session-id: $SID" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-opus-4-8","max_tokens":64,"system":"You are Claude Code.","messages":[{"role":"user","content":"ping"}]}' > /dev/null
+
+# ① 关键：本次 session 是否走了 debugForceIdentity 分支
+grep -aE "session-init:cc.*DEBUG bypass.*force identity" ~/.tdai-lab/proxy.log | tail -3
+# 期望：至少 1 行含 team=team-xxxx agent=agt-xxxx（用你的真实主键）
+
+# ② 是否还有 agent_not_found: brain
+grep -aE "agent_not_found: agent not found: (brain|$AGENT)" ~/.tdai-lab/proxy.log | tail -3
+# 期望：无带本次 SID 的新行（历史行时间戳早于本次重启，忽略）
+
+# ③ 磁盘上新 binding.json 是否已切到真主键
+find ~/.memory-tencentdb/proxy-state/nottl -name binding.json -newer ~/.tdai-lab/proxy.yaml \
+  -exec grep -oE '"agentId":"[^"]+"' {} \; | sort -u
+# 期望：只见 "agentId":"agt-xxxxxxxxxx"，不再有 "agentId":"brain"
+```
+
+三条同时满足才算真绿。**如果 ① 没看到 DEBUG bypass 行**——说明 proxy-state 没清干净或 yaml 未生效，回 Step 2 / Step 2.5 复查。
+
+> ★**副作用提示**：本节做了两件动手术的事——
+> - **切换 debugForceIdentity**：新会话的**记忆命名空间**从 `tdai-lab/brain/validate` 迁到 `<新 team_id>/<新 agent_id>/validate`；§4.x 用旧命名空间沉淀的 L0/L1/L2/L3 **只在旧命名空间保留**，新会话召不回。
+> - **清空 `~/.memory-tencentdb/proxy-state/nottl`**：所有历史 sess-* 的绑定关系（sess-id → team/agent/task）一并抹掉；已有 session 再来请求会被 proxy 当"新 session"重新绑到新主键上。
+>
+> 当前只是 sess-smoke-* 冒烟，没有真正跨会话验证需要保留的记忆，两个操作都无损失；若你已经在 §4.3 验过跨会话召回并想留住那批沉淀，**跳过本节即可**（fallback "只注入自己" 也能用，日志脏但功能不受影响）。
+
+### 5.3-前置：搞清主 CC 现在从哪里读 token / BASE_URL（别糊涂地覆盖）
+
+**为什么要看**：接下来 §5.3 要把 CC 指向本地 proxy——如果我们**改错了地方**，会把**所有终端**里的 CC 全都强制走 proxy；一旦 proxy 挂了，你的所有 CC 全部失联（生命线断）。所以先看清主 CC 现在到底靠什么跑起来的，再决定"在哪加一份指向 proxy 的配置最安全"。
+
+主 CC 读 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 有 3 个可能来源：
+
+```sh
+# ① 当前这个终端窗口自己 export 了（是从 ② 继承来的）
+env | grep -E "^ANTHROPIC_(BASE_URL|AUTH_TOKEN)" | sed 's/=.*/=<REDACTED>/'
+# ② ~/.zshrc —— 每开一个新终端窗口，都会自动 source 一次，把 export 语句执行一遍
+grep -E "^export ANTHROPIC_(BASE_URL|AUTH_TOKEN)" ~/.zshrc | sed 's/=.*/=<REDACTED>/'
+# ③ ~/.claude/settings.json 的 env 段 —— 只对 CC 自己生效
+python3 -c "
+import json,os
+p=os.path.expanduser('~/.claude/settings.json')
+if os.path.exists(p):
+    d=json.load(open(p)).get('env',{})
+    print({k:'<REDACTED>' for k in d if k.startswith('ANTHROPIC_')})
+"
+```
+
+**看输出，找到你当前"生命线"在哪**：
+
+| ② zshrc 有值 | ③ settings 有值 | 判定 |
+|---|---|---|
+| ✅ | / | 生命线是 zshrc（本机就是这种） |
+| ❌ | ✅ | 生命线是 settings.json |
+| ❌ | ❌ | 只有当前终端 ① 有值，关掉这个终端主 CC 就没法跑了——极罕见 |
+
+**核心规则（一句话）**：
+
+> **绝对不要修改** ②（zshrc）**和** ③（settings.json）**里那份指向 ducky 的值**。它是主 CC 的生命线，改错了所有终端一起断。**§5.3 的做法是另起一个新终端，只在这个新终端里临时 `export` 覆盖**——这份临时 export 只影响这个新终端，关掉窗口就消失，其他终端里主 CC 依然走 ducky。
+
+**为什么临时 export 能生效**（一句话）：
+
+> 新终端一开就会自动 source 一次 zshrc → 继承 ducky 的值到当前 shell（这就是 ① 层）；然后你 `export` 一遍新的值，就把这个终端里的 ① 层覆盖成指向 proxy。进程读环境变量时**读的就是 ① 层**，所以看到的是 proxy。关掉终端 → ① 层随进程消失 → 下次再开又回到 ducky。
+
+**回退方式**：
+- **关掉这个新终端** = 覆盖立即消失，最简单。
+- 或在这个新终端里 `unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN`，同一个 shell 里立刻回到 ducky（但重新 `source ~/.zshrc` 会再把 ducky 的值加回来）。
+
+---
+
+### 5.3 把 CC 指向 proxy（新增 `claude-mem` 命令，不动 ducky 生命线）
+
+★前提：5.2 五条判据全绿（包括 ⑤ core ACL 无 401、⑥ 无 FK 失败）+ 5.3-前置 已确认 ②/③ 层 ducky 生命线存在。任一未满足别进本节，改路由等于把主 CC 挂到一条可能坏的链路上。
+
+**思路**：不覆盖任何现有变量、不动 `claude` 这个命令本身，只在 `~/.zshrc` 里**新增一个 zsh 函数** `claude-mem`——它在子 shell 里 export 指向 proxy 的两个变量后 `exec claude`。`claude-mem` 走 proxy 带记忆，`claude` 依然走 ducky（生命线一字不动）。
+
+**Bearer 用什么**：sk-mem key（`~/.tdai-lab/cc-authtoken.sk-mem`，§5.2 Step 1 已生成）——**不是 ducky token**。ducky token 已经在 §5.1 灌到 proxy 的 `upstream.apiKey`，proxy 出站到 ducky 时自己会用。详见「补充 §15」。
+
+#### Step 1 — 在 `~/.zshrc` 末尾追加函数（一次性，之后长期可用）
+
+```sh
+cat >> ~/.zshrc <<'EOF'
+
+# ── TencentDB Agent Memory: claude-mem = 走本地 proxy 的 CC（含记忆），claude 不动仍走 ducky ──
+claude-mem() {
+  (
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8096/claude-code/default"
+    export ANTHROPIC_AUTH_TOKEN="$(cat ~/.tdai-lab/cc-authtoken.sk-mem)"
+    exec claude "$@"
+  )
+}
+EOF
+```
+
+**为什么这么写（3 个关键点）**：
+
+| 写法 | 作用 | 不这么写会怎样 |
+|---|---|---|
+| `(...)` 子 shell 包一层 | export 只作用在子 shell 里，父 shell 环境完全没变 | 不包，export 污染当前终端，后续这个终端里再敲 `claude` 也会被拉去 proxy |
+| `exec claude` | 用 claude 进程替换子 shell，不留多余进程 | 不 exec 会多一层 shell 进程壳，不影响功能但不干净 |
+| `"$@"` 透传参数 | `claude-mem "帮我看代码"` 参数完整传给 claude | 不加，参数吞掉 |
+
+**这一步安全性**：只是**新增**一个函数，**不修改**任何现有 `export ANTHROPIC_*` 行，主 CC 的 ducky 链路一字未动。
+
+#### Step 2 — 让新函数生效
+
+```sh
+source ~/.zshrc
+type claude-mem       # 期望：claude-mem is a shell function ...
+type claude           # 期望：claude is /...（原样，未被覆盖）
+```
+
+#### Step 3 — 试跑一次，看走没走 proxy
+
+在**当前这个终端**（不用另开新终端了）直接：
+```sh
+claude-mem
+```
+
+进入 CC 后，问它一句可验证的私人问题，比如："我叫什么？我用哪个 provider？"
+
+判定：
+
+| 现象 | 判定 |
+|---|---|
+| CC 回答里带出「银时」「idealab」「不换 provider」中至少一项 | ✅ 走了 proxy，记忆生效 |
+| CC 回答完全不知道你是谁 | ❌ 没走 proxy——先在这个终端里 `echo $ANTHROPIC_BASE_URL`，应该是空的（因为子 shell 结束后父 shell 环境不变）；`claude-mem` 内部才有 8096。若仍不行，看 `~/.tdai-lab/proxy.log` 有没有新流量 |
+
+同时另开一个终端跑 `echo $ANTHROPIC_BASE_URL`（不要用 `claude-mem`，直接开新终端）——**必须为空**，证明 zshrc 里的 ducky 生命线没被污染。
+
+#### 回退
+
+**不需要回退**——`claude-mem` 只是新增函数，不影响任何现有命令。真想删掉，编辑 `~/.zshrc` 把那段块注释或删掉，`source ~/.zshrc` 即可；或直接 `unset -f claude-mem` 只在当前终端撤销。
+
+**紧急止损**：即使 proxy 挂了、`claude-mem` 打不开 CC，**`claude` 命令依然走 ducky 可用**——生命线在。
+
+---
+
+## 6. 验收 checklist（全绿=搭建完成）
+
+```sh
+# ① node 版本
+node -v                                                    # v22.x
+# ② core / proxy 健康
+curl -s -o /dev/null -w "core=%{http_code}\n" http://127.0.0.1:8420/health   # 200
+curl -s -o /dev/null -w "proxy=%{http_code}\n" http://127.0.0.1:8096/ 2>/dev/null
+# ③ admin key 可用
+curl -s -X POST http://127.0.0.1:8420/v3/meta/auth/verify -H "x-tdai-service-id: default" \
+  -H "Content-Type: application/json" -d "$(printf '{"user_key":"%s"}' "$(cat ~/.tdai-lab/user.key)")" \
+  -o /dev/null -w "verify=%{http_code}\n"                  # 200
+# ④ 透传：转发头里是入站 Bearer、无 x-api-key
+tail -1 ~/.tdai-lab/mock-headers.json                      # authorization=Bearer...，x-api-key=null
+# ⑤ 沉淀：原子已抽出
+grep -ac "conversation/add" ~/.tdai-lab/memory-core.log    # >0（-a：日志夹二进制字节，不加会输出 0）
+# ⑥ 跨会话注入：新会话 body 含历史画像
+grep -ac "银时" ~/.tdai-lab/mock-lastbody.json              # >0
+```
+逐项对照第 2~4 节预期。任何一项不符，回对应小节 + 查「补充」同名章节。
+
+---
+
+## 7. 清理（验证结束不接入时）
+```sh
+~/.tdai-lab/stop-all.sh       # 先把 3 个进程全停
+rm -rf ~/.tdai-lab            # 数据、配置、密钥、脚本全清；主 CC 零残留
+```
+
+---
+
+> 配套：`用户视角tencentdb-agent-memory业务流程.md`（什么感觉）、`tencentdb-agent-memory搭建 - 补充说明.md`（坑与原理，每个「见补充 §N」都在那）。
